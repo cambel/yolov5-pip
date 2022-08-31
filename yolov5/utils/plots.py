@@ -7,7 +7,6 @@ import math
 import os
 from copy import copy
 from pathlib import Path
-from urllib.error import URLError
 
 import cv2
 import matplotlib
@@ -17,13 +16,14 @@ import pandas as pd
 import seaborn as sn
 import torch
 from PIL import Image, ImageDraw, ImageFont
-from yolov5.utils.general import (CONFIG_DIR, FONT, LOGGER, Timeout,
-                                  check_font, check_requirements, clip_coords,
-                                  increment_path, is_ascii, threaded,
-                                  try_except, xywh2xyxy, xyxy2xywh)
+
+from yolov5.utils.general import (LOGGER, Timeout, check_requirements, clip_coords, increment_path, is_ascii, is_chinese,
+                           try_except, user_config_dir, xywh2xyxy, xyxy2xywh)
 from yolov5.utils.metrics import fitness
+from yolov5.utils.rboxs_utils import poly2hbb, poly2rbox, rbox2poly
 
 # Settings
+CONFIG_DIR = user_config_dir()  # Ultralytics settings dir
 RANK = int(os.getenv('RANK', -1))
 matplotlib.rc('font', **{'size': 11})
 matplotlib.use('Agg')  # for writing to files only
@@ -33,9 +33,9 @@ class Colors:
     # Ultralytics color palette https://ultralytics.com/
     def __init__(self):
         # hex = matplotlib.colors.TABLEAU_COLORS.values()
-        hexs = ('FF3838', 'FF9D97', 'FF701F', 'FFB21D', 'CFD231', '48F90A', '92CC17', '3DDB86', '1A9334', '00D4BB',
-                '2C99A8', '00C2FF', '344593', '6473FF', '0018EC', '8438FF', '520085', 'CB38FF', 'FF95C8', 'FF37C7')
-        self.palette = [self.hex2rgb(f'#{c}') for c in hexs]
+        hex = ('FF3838', 'FF9D97', 'FF701F', 'FFB21D', 'CFD231', '48F90A', '92CC17', '3DDB86', '1A9334', '00D4BB',
+               '2C99A8', '00C2FF', '344593', '6473FF', '0018EC', '8438FF', '520085', 'CB38FF', 'FF95C8', 'FF37C7')
+        self.palette = [self.hex2rgb('#' + c) for c in hex]
         self.n = len(self.palette)
 
     def __call__(self, i, bgr=False):
@@ -47,38 +47,42 @@ class Colors:
         return tuple(int(h[1 + i:1 + i + 2], 16) for i in (0, 2, 4))
 
 
-colors = Colors()  # create instance for 'from utils.plots import colors'
+colors = Colors()  # create instance for 'from yolov5.utils.plots import colors'
 
 
-def check_pil_font(font=FONT, size=10):
+def check_font(font='Arial.ttf', size=10):
     # Return a PIL TrueType Font, downloading to CONFIG_DIR if necessary
     font = Path(font)
     font = font if font.exists() else (CONFIG_DIR / font.name)
     try:
         return ImageFont.truetype(str(font) if font.exists() else font.name, size)
-    except Exception:  # download if missing
+    except Exception as e:  # download if missing
+        url = "https://ultralytics.com/assets/" + font.name
+        print(f'Downloading {url} to {font}...')
+        torch.hub.download_url_to_file(url, str(font), progress=False)
         try:
-            check_font(font)
             return ImageFont.truetype(str(font), size)
         except TypeError:
             check_requirements('Pillow>=8.4.0')  # known issue https://github.com/ultralytics/yolov5/issues/5374
-        except URLError:  # not online
-            return ImageFont.load_default()
 
 
 class Annotator:
+    if RANK in (-1, 0):
+        check_font()  # download TTF if necessary
+
     # YOLOv5 Annotator for train/val mosaics and jpgs and detect/hub inference annotations
     def __init__(self, im, line_width=None, font_size=None, font='Arial.ttf', pil=False, example='abc'):
         assert im.data.contiguous, 'Image not contiguous. Apply np.ascontiguousarray(im) to Annotator() input images.'
-        non_ascii = not is_ascii(example)  # non-latin labels, i.e. asian, arabic, cyrillic
-        self.pil = pil or non_ascii
+        self.pil = pil or not is_ascii(example) or is_chinese(example)
         if self.pil:  # use PIL
             self.im = im if isinstance(im, Image.Image) else Image.fromarray(im)
+            self.im_cv2 = im
             self.draw = ImageDraw.Draw(self.im)
-            self.font = check_pil_font(font='Arial.Unicode.ttf' if non_ascii else font,
-                                       size=font_size or max(round(sum(self.im.size) / 2 * 0.035), 12))
+            self.font = check_font(font='Arial.Unicode.ttf' if is_chinese(example) else font,
+                                   size=font_size or max(round(sum(self.im.size) / 2 * 0.035), 12))
         else:  # use cv2
             self.im = im
+            self.im_cv2 = im
         self.lw = line_width or max(round(sum(im.shape) / 2 * 0.003), 2)  # line width
 
     def box_label(self, box, label='', color=(128, 128, 128), txt_color=(255, 255, 255)):
@@ -88,29 +92,59 @@ class Annotator:
             if label:
                 w, h = self.font.getsize(label)  # text width, height
                 outside = box[1] - h >= 0  # label fits outside box
-                self.draw.rectangle(
-                    (box[0], box[1] - h if outside else box[1], box[0] + w + 1,
-                     box[1] + 1 if outside else box[1] + h + 1),
-                    fill=color,
-                )
+                self.draw.rectangle([box[0],
+                                     box[1] - h if outside else box[1],
+                                     box[0] + w + 1,
+                                     box[1] + 1 if outside else box[1] + h + 1], fill=color)
                 # self.draw.text((box[0], box[1]), label, fill=txt_color, font=self.font, anchor='ls')  # for PIL>8.0
                 self.draw.text((box[0], box[1] - h if outside else box[1]), label, fill=txt_color, font=self.font)
         else:  # cv2
             p1, p2 = (int(box[0]), int(box[1])), (int(box[2]), int(box[3]))
-            cv2.rectangle(self.im, p1, p2, color, thickness=self.lw, lineType=cv2.LINE_AA)
+            cv2.rectangle(self.im_cv2, p1, p2, color, thickness=self.lw)
+            # if label:
+            #     tf = max(self.lw - 1, 1)  # font thickness
+            #     w, h = cv2.getTextSize(label, 0, fontScale=self.lw / 3, thickness=tf)[0]  # text width, height
+            #     outside = p1[1] - h - 3 >= 0  # label fits outside box
+            #     p2 = p1[0] + w, p1[1] - h - 3 if outside else p1[1] + h + 3
+            #     cv2.rectangle(self.im, p1, p2, color, -1, cv2.LINE_AA)  # filled
+            #     cv2.putText(self.im, label, (p1[0], p1[1] - 2 if outside else p1[1] + h + 2), 0, self.lw / 3, txt_color,
+            #                 thickness=tf, lineType=cv2.LINE_AA)
+            self.im = self.im_cv2 if isinstance(self.im_cv2, Image.Image) else Image.fromarray(self.im_cv2)
+    
+    def poly_label(self, poly, label='', color=(128, 128, 128), txt_color=(255, 255, 255)):
+        # if self.pil or not is_ascii(label):
+        #     self.draw.polygon(xy=poly, outline=color)
+        #     if label:
+        #         xmax, xmin, ymax, ymin = max(poly[0::2]), min(poly[0::2]), max(poly[1::2]), min(poly[1::2])
+        #         x_label, y_label = (xmax + xmin)/2, (ymax + ymin)/2
+        #         w, h = self.font.getsize(label)  # text width, height
+        #         outside = ymin - h >= 0  # label fits outside box
+        #         self.draw.rectangle([x_label,
+        #                              y_label - h if outside else y_label,
+        #                              x_label + w + 1,
+        #                              y_label + 1 if outside else y_label + h + 1], fill=color)
+        #         self.draw.text((x_label, y_label - h if outside else y_label), label, fill=txt_color, font=self.font)
+        # else:
+            if isinstance(poly, torch.Tensor):
+                poly = poly.cpu().numpy()
+            if isinstance(poly[0], torch.Tensor):
+                poly = [x.cpu().numpy() for x in poly]
+            polygon_list = np.array([(poly[0], poly[1]), (poly[2], poly[3]), \
+                    (poly[4], poly[5]), (poly[6], poly[7])], np.int32)
+            cv2.drawContours(image=self.im_cv2, contours=[polygon_list], contourIdx=-1, color=color, thickness=self.lw)
             if label:
-                tf = max(self.lw - 1, 1)  # font thickness
-                w, h = cv2.getTextSize(label, 0, fontScale=self.lw / 3, thickness=tf)[0]  # text width, height
-                outside = p1[1] - h >= 3
-                p2 = p1[0] + w, p1[1] - h - 3 if outside else p1[1] + h + 3
-                cv2.rectangle(self.im, p1, p2, color, -1, cv2.LINE_AA)  # filled
-                cv2.putText(self.im,
-                            label, (p1[0], p1[1] - 2 if outside else p1[1] + h + 2),
-                            0,
-                            self.lw / 3,
-                            txt_color,
-                            thickness=tf,
-                            lineType=cv2.LINE_AA)
+                tf = max(self.lw - 1, 1)  # font thicknes
+                xmax, xmin, ymax, ymin = max(poly[0::2]), min(poly[0::2]), max(poly[1::2]), min(poly[1::2])
+                x_label, y_label = int((xmax + xmin)/2), int((ymax + ymin)/2)
+                w, h = cv2.getTextSize(label, 0, fontScale=self.lw / 4, thickness=tf)[0]  # text width, height
+                cv2.rectangle(
+                                self.im_cv2,
+                                (x_label, y_label),
+                                (x_label + w + 1, y_label + int(1.5*h)),
+                                color, -1, cv2.LINE_AA
+                            )
+                cv2.putText(self.im_cv2, label, (x_label, y_label + h), 0, self.lw / 3, txt_color, thickness=tf, lineType=cv2.LINE_AA)
+            self.im = self.im_cv2 if isinstance(self.im_cv2, Image.Image) else Image.fromarray(self.im_cv2)
 
     def rectangle(self, xy, fill=None, outline=None, width=1):
         # Add rectangle to image (PIL-only)
@@ -148,7 +182,7 @@ def feature_visualization(x, module_type, stage, n=32, save_dir=Path('runs/detec
                 ax[i].imshow(blocks[i].squeeze())  # cmap='gray'
                 ax[i].axis('off')
 
-            LOGGER.info(f'Saving {f}... ({n}/{channels})')
+            print(f'Saving {f}... ({n}/{channels})')
             plt.savefig(f, dpi=300, bbox_inches='tight')
             plt.close()
             np.save(str(f.with_suffix('.npy')), x[0].cpu().numpy())  # npy save
@@ -176,17 +210,26 @@ def butter_lowpass_filtfilt(data, cutoff=1500, fs=50000, order=5):
     return filtfilt(b, a, data)  # forward-backward filter
 
 
-def output_to_target(output):
-    # Convert model output to target format [batch_id, class_id, x, y, w, h, conf]
+def output_to_target(output): #list*(n, [xylsθ, conf, cls]) θ ∈ [-pi/2, pi/2)
+    # Convert model output to target format [batch_id, class_id, x, y, l, s, theta, conf]
     targets = []
     for i, o in enumerate(output):
-        for *box, conf, cls in o.cpu().numpy():
-            targets.append([i, cls, *list(*xyxy2xywh(np.array(box)[None])), conf])
+        for *rbox, conf, cls in o.cpu().numpy():
+            targets.append([i, cls, *list(*(np.array(rbox)[None])), conf])
     return np.array(targets)
 
 
-@threaded
-def plot_images(images, targets, paths=None, fname='images.jpg', names=None, max_size=1920, max_subplots=16):
+def plot_images(images, targets, paths=None, fname='images.jpg', names=None, max_size=2048, max_subplots=4):
+    """
+    Args:
+        imgs (tensor): (b, 3, height, width)
+        targets_train (tensor): (n_targets, [batch_id clsid cx cy l s theta gaussian_θ_labels]) θ∈[-pi/2, pi/2)
+        targets_pred (array): (n, [batch_id, class_id, cx, cy, l, s, theta, conf]) θ∈[-pi/2, pi/2)
+        paths (list[str,...]): (b)
+        fname (str): (1) 
+        names :
+
+    """
     # Plot image grid with labels
     if isinstance(images, torch.Tensor):
         images = images.cpu().float().numpy()
@@ -216,36 +259,50 @@ def plot_images(images, targets, paths=None, fname='images.jpg', names=None, max
 
     # Annotate
     fs = int((h + w) * ns * 0.01)  # font size
-    annotator = Annotator(mosaic, line_width=round(fs / 10), font_size=fs, pil=True, example=names)
+    annotator = Annotator(mosaic, line_width=round(fs / 10), font_size=fs, pil=True)
     for i in range(i + 1):
         x, y = int(w * (i // ns)), int(h * (i % ns))  # block origin
         annotator.rectangle([x, y, x + w, y + h], None, (255, 255, 255), width=2)  # borders
         if paths:
             annotator.text((x + 5, y + 5 + h), text=Path(paths[i]).name[:40], txt_color=(220, 220, 220))  # filenames
         if len(targets) > 0:
-            ti = targets[targets[:, 0] == i]  # image targets
-            boxes = xywh2xyxy(ti[:, 2:6]).T
+            ti = targets[targets[:, 0] == i]  # image targets, (n, [img_index clsid cx cy l s theta gaussian_θ_labels])
+            # boxes = xywh2xyxy(ti[:, 2:6]).T
+            rboxes = ti[:, 2:7]
             classes = ti[:, 1].astype('int')
-            labels = ti.shape[1] == 6  # labels if no conf column
-            conf = None if labels else ti[:, 6]  # check for confidence presence (label vs pred)
+            # labels = ti.shape[1] == 6  # labels if no conf column
+            labels = ti.shape[1] == 187  # labels if no conf column
+            # conf = None if labels else ti[:, 6]  # check for confidence presence (label vs pred)
+            conf = None if labels else ti[:, 7]  # check for confidence presence (label vs pred)
 
-            if boxes.shape[1]:
-                if boxes.max() <= 1.01:  # if normalized with tolerance 0.01
-                    boxes[[0, 2]] *= w  # scale to pixels
-                    boxes[[1, 3]] *= h
-                elif scale < 1:  # absolute coords need scale if image scales
-                    boxes *= scale
-            boxes[[0, 2]] += x
-            boxes[[1, 3]] += y
-            for j, box in enumerate(boxes.T.tolist()):
+            # if boxes.shape[1]:
+            #     if boxes.max() <= 1.01:  # if normalized with tolerance 0.01
+            #         boxes[[0, 2]] *= w  # scale to pixels
+            #         boxes[[1, 3]] *= h
+            #     elif scale < 1:  # absolute coords need scale if image scales
+            #         boxes *= scale
+            polys = rbox2poly(rboxes)
+            if scale < 1:
+                polys *= scale
+            # boxes[[0, 2]] += x
+            # boxes[[1, 3]] += y
+            polys[:, [0, 2, 4, 6]] += x
+            polys[:, [1, 3, 5, 7]] += y
+            # for j, box in enumerate(boxes.T.tolist()):
+            #     cls = classes[j]
+            #     color = colors(cls)
+            #     cls = names[cls] if names else cls
+            #     if labels or conf[j] > 0.25:  # 0.25 conf thresh
+            #         label = f'{cls}' if labels else f'{cls} {conf[j]:.1f}'
+            #         annotator.box_label(box, label, color=color)
+            for j, poly in enumerate(polys.tolist()):
                 cls = classes[j]
                 color = colors(cls)
                 cls = names[cls] if names else cls
                 if labels or conf[j] > 0.25:  # 0.25 conf thresh
-                    label = f'{cls}' if labels else f'{cls} {conf[j]:.1f}'
-                    annotator.box_label(box, label, color=color)
+                    label = f'{cls}' if labels else f'{cls} {conf[j]:.1f}'   
+                    annotator.poly_label(poly, label, color=color)
     annotator.im.save(fname)  # save
-
 
 def plot_lr_scheduler(optimizer, scheduler, epochs=300, save_dir=''):
     # Plot LR simulating training for full epochs
@@ -264,7 +321,7 @@ def plot_lr_scheduler(optimizer, scheduler, epochs=300, save_dir=''):
     plt.close()
 
 
-def plot_val_txt():  # from utils.plots import *; plot_val()
+def plot_val_txt():  # from yolov5.utils.plots import *; plot_val()
     # Plot val.txt histograms
     x = np.loadtxt('val.txt', dtype=np.float32)
     box = xyxy2xywh(x[:, :4])
@@ -281,7 +338,7 @@ def plot_val_txt():  # from utils.plots import *; plot_val()
     plt.savefig('hist1d.png', dpi=200)
 
 
-def plot_targets_txt():  # from utils.plots import *; plot_targets_txt()
+def plot_targets_txt():  # from yolov5.utils.plots import *; plot_targets_txt()
     # Plot targets.txt histograms
     x = np.loadtxt('targets.txt', dtype=np.float32).T
     s = ['x targets', 'y targets', 'width targets', 'height targets']
@@ -294,7 +351,7 @@ def plot_targets_txt():  # from utils.plots import *; plot_targets_txt()
     plt.savefig('targets.jpg', dpi=200)
 
 
-def plot_val_study(file='', dir='', x=None):  # from utils.plots import *; plot_val_study()
+def plot_val_study(file='', dir='', x=None):  # from yolov5.utils.plots import *; plot_val_study()
     # Plot file=study.txt generated by val.py (or plot all study*.txt in dir)
     save_dir = Path(file).parent if file else Path(dir)
     plot2 = False  # plot additional results
@@ -307,25 +364,17 @@ def plot_val_study(file='', dir='', x=None):  # from utils.plots import *; plot_
         y = np.loadtxt(f, dtype=np.float32, usecols=[0, 1, 2, 3, 7, 8, 9], ndmin=2).T
         x = np.arange(y.shape[1]) if x is None else np.array(x)
         if plot2:
-            s = ['P', 'R', 'mAP@.5', 'mAP@.5:.95', 't_preprocess (ms/img)', 't_inference (ms/img)', 't_NMS (ms/img)']
+            s = ['P', 'R', 'HBBmAP@.5', 'HBBmAP@.5:.95', 't_preprocess (ms/img)', 't_inference (ms/img)', 't_NMS (ms/img)']
             for i in range(7):
                 ax[i].plot(x, y[i], '.-', linewidth=2, markersize=8)
                 ax[i].set_title(s[i])
 
         j = y[3].argmax() + 1
-        ax2.plot(y[5, 1:j],
-                 y[3, 1:j] * 1E2,
-                 '.-',
-                 linewidth=2,
-                 markersize=8,
+        ax2.plot(y[5, 1:j], y[3, 1:j] * 1E2, '.-', linewidth=2, markersize=8,
                  label=f.stem.replace('study_coco_', '').replace('yolo', 'YOLO'))
 
     ax2.plot(1E3 / np.array([209, 140, 97, 58, 35, 18]), [34.6, 40.5, 43.0, 47.5, 49.7, 51.5],
-             'k.-',
-             linewidth=2,
-             markersize=8,
-             alpha=.25,
-             label='EfficientDet')
+             'k.-', linewidth=2, markersize=8, alpha=.25, label='EfficientDet')
 
     ax2.grid(alpha=0.2)
     ax2.set_yticks(np.arange(20, 60, 5))
@@ -341,12 +390,15 @@ def plot_val_study(file='', dir='', x=None):  # from utils.plots import *; plot_
 
 @try_except  # known issue https://github.com/ultralytics/yolov5/issues/5395
 @Timeout(30)  # known issue https://github.com/ultralytics/yolov5/issues/5611
-def plot_labels(labels, names=(), save_dir=Path('')):
+def plot_labels(labels, names=(), save_dir=Path(''), img_size=1024):
+    rboxes = poly2rbox(labels[:, 1:])
+    labels = np.concatenate((labels[:, :1], rboxes[:, :-1]), axis=1) # [cls xyls]
+
     # plot dataset labels
-    LOGGER.info(f"Plotting labels to {save_dir / 'labels.jpg'}... ")
-    c, b = labels[:, 0], labels[:, 1:].transpose()  # classes, boxes
+    LOGGER.info(f"Plotting labels to {save_dir / 'labels_xyls.jpg'}... ")
+    c, b = labels[:, 0], labels[:, 1:].transpose()  # classes, hboxes(xyls)
     nc = int(c.max() + 1)  # number of classes
-    x = pd.DataFrame(b.transpose(), columns=['x', 'y', 'width', 'height'])
+    x = pd.DataFrame(b.transpose(), columns=['x', 'y', 'long_edge', 'short_edge'])
 
     # seaborn correlogram
     sn.pairplot(x, corner=True, diag_kind='auto', kind='hist', diag_kws=dict(bins=50), plot_kws=dict(pmax=0.9))
@@ -357,10 +409,7 @@ def plot_labels(labels, names=(), save_dir=Path('')):
     matplotlib.use('svg')  # faster
     ax = plt.subplots(2, 2, figsize=(8, 8), tight_layout=True)[1].ravel()
     y = ax[0].hist(c, bins=np.linspace(0, nc, nc + 1) - 0.5, rwidth=0.8)
-    try:  # color histogram bars by class
-        [y[2].patches[i].set_color([x / 255 for x in colors(i)]) for i in range(nc)]  # known issue #3195
-    except Exception:
-        pass
+    # [y[2].patches[i].set_color([x / 255 for x in colors(i)]) for i in range(nc)]  # update colors bug #3195
     ax[0].set_ylabel('instances')
     if 0 < len(names) < 30:
         ax[0].set_xticks(range(len(names)))
@@ -368,12 +417,15 @@ def plot_labels(labels, names=(), save_dir=Path('')):
     else:
         ax[0].set_xlabel('classes')
     sn.histplot(x, x='x', y='y', ax=ax[2], bins=50, pmax=0.9)
-    sn.histplot(x, x='width', y='height', ax=ax[3], bins=50, pmax=0.9)
+    sn.histplot(x, x='long_edge', y='short_edge', ax=ax[3], bins=50, pmax=0.9)
 
     # rectangles
-    labels[:, 1:3] = 0.5  # center
-    labels[:, 1:] = xywh2xyxy(labels[:, 1:]) * 2000
-    img = Image.fromarray(np.ones((2000, 2000, 3), dtype=np.uint8) * 255)
+    # labels[:, 1:3] = 0.5 # center
+    labels[:, 1:3] = 0.5 * img_size # center
+    # labels[:, 1:] = xywh2xyxy(labels[:, 1:]) * 2000
+    labels[:, 1:] = xywh2xyxy(labels[:, 1:]) 
+    # img = Image.fromarray(np.ones((2000, 2000, 3), dtype=np.uint8) * 255)
+    img = Image.fromarray(np.ones((img_size, img_size, 3), dtype=np.uint8) * 255)
     for cls, *box in labels[:1000]:
         ImageDraw.Draw(img).rectangle(box, width=1, outline=colors(cls))  # plot
     ax[1].imshow(img)
@@ -383,12 +435,12 @@ def plot_labels(labels, names=(), save_dir=Path('')):
         for s in ['top', 'right', 'left', 'bottom']:
             ax[a].spines[s].set_visible(False)
 
-    plt.savefig(save_dir / 'labels.jpg', dpi=200)
+    plt.savefig(save_dir / 'labels_xyls.jpg', dpi=200)
     matplotlib.use('Agg')
     plt.close()
 
 
-def plot_evolve(evolve_csv='path/to/evolve.csv'):  # from utils.plots import *; plot_evolve()
+def plot_evolve(evolve_csv='path/to/evolve.csv'):  # from yolov5.utils.plots import *; plot_evolve()
     # Plot evolve.csv hyp evolution results
     evolve_csv = Path(evolve_csv)
     data = pd.read_csv(evolve_csv)
@@ -398,7 +450,6 @@ def plot_evolve(evolve_csv='path/to/evolve.csv'):  # from utils.plots import *; 
     j = np.argmax(f)  # max fitness index
     plt.figure(figsize=(10, 12), tight_layout=True)
     matplotlib.rc('font', **{'size': 8})
-    print(f'Best results from row {j} of {evolve_csv}:')
     for i, k in enumerate(keys[7:]):
         v = x[:, 7 + i]
         mu = v[j]  # best single result
@@ -416,33 +467,35 @@ def plot_evolve(evolve_csv='path/to/evolve.csv'):  # from utils.plots import *; 
 
 
 def plot_results(file='path/to/results.csv', dir=''):
-    # Plot training results.csv. Usage: from utils.plots import *; plot_results('path/to/results.csv')
+    # Plot training results.csv. Usage: from yolov5.utils.plots import *; plot_results('path/to/results.csv')
     save_dir = Path(file).parent if file else Path(dir)
-    fig, ax = plt.subplots(2, 5, figsize=(12, 6), tight_layout=True)
+    #fig, ax = plt.subplots(2, 5, figsize=(12, 6), tight_layout=True)
+    fig, ax = plt.subplots(2, 6, figsize=(18, 6), tight_layout=True)
     ax = ax.ravel()
     files = list(save_dir.glob('results*.csv'))
     assert len(files), f'No results.csv files found in {save_dir.resolve()}, nothing to plot.'
-    for f in files:
+    for fi, f in enumerate(files):
         try:
             data = pd.read_csv(f)
             s = [x.strip() for x in data.columns]
             x = data.values[:, 0]
-            for i, j in enumerate([1, 2, 3, 4, 5, 8, 9, 10, 6, 7]):
-                y = data.values[:, j].astype('float')
+            #for i, j in enumerate([1, 2, 3, 4, 5, 8, 9, 10, 6, 7]):
+            for i, j in enumerate([1, 2, 3, 4, 5, 6, 9, 10, 11, 12, 7, 8]):
+                y = data.values[:, j]
                 # y[y == 0] = np.nan  # don't show zero values
                 ax[i].plot(x, y, marker='.', label=f.stem, linewidth=2, markersize=8)
                 ax[i].set_title(s[j], fontsize=12)
                 # if j in [8, 9, 10]:  # share train and val loss y axes
                 #     ax[i].get_shared_y_axes().join(ax[i], ax[i - 5])
         except Exception as e:
-            LOGGER.info(f'Warning: Plotting error for {f}: {e}')
+            print(f'Warning: Plotting error for {f}: {e}')
     ax[1].legend()
     fig.savefig(save_dir / 'results.png', dpi=200)
     plt.close()
 
 
 def profile_idetection(start=0, stop=0, labels=(), save_dir=''):
-    # Plot iDetection '*.txt' per-image logs. from utils.plots import *; profile_idetection()
+    # Plot iDetection '*.txt' per-image logs. from yolov5.utils.plots import *; profile_idetection()
     ax = plt.subplots(2, 4, figsize=(12, 6), tight_layout=True)[1].ravel()
     s = ['Images', 'Free Storage (GB)', 'RAM Usage (GB)', 'Battery', 'dt_raw (ms)', 'dt_smooth (ms)', 'real-world FPS']
     files = list(Path(save_dir).glob('frames*.txt'))
@@ -472,7 +525,7 @@ def profile_idetection(start=0, stop=0, labels=(), save_dir=''):
     plt.savefig(Path(save_dir) / 'idetection_profile.png', dpi=200)
 
 
-def save_one_box(xyxy, im, file=Path('im.jpg'), gain=1.02, pad=10, square=False, BGR=False, save=True):
+def save_one_box(xyxy, im, file='image.jpg', gain=1.02, pad=10, square=False, BGR=False, save=True):
     # Save image crop as {file} with crop size multiple {gain} and {pad} pixels. Save and/or return crop
     xyxy = torch.tensor(xyxy).view(-1, 4)
     b = xyxy2xywh(xyxy)  # boxes
@@ -484,7 +537,5 @@ def save_one_box(xyxy, im, file=Path('im.jpg'), gain=1.02, pad=10, square=False,
     crop = im[int(xyxy[0, 1]):int(xyxy[0, 3]), int(xyxy[0, 0]):int(xyxy[0, 2]), ::(1 if BGR else -1)]
     if save:
         file.parent.mkdir(parents=True, exist_ok=True)  # make directory
-        f = str(increment_path(file).with_suffix('.jpg'))
-        # cv2.imwrite(f, crop)  # save BGR, https://github.com/ultralytics/yolov5/issues/7007 chroma subsampling issue
-        Image.fromarray(crop[..., ::-1]).save(f, quality=95, subsampling=0)  # save RGB
+        cv2.imwrite(str(increment_path(file).with_suffix('.jpg')), crop)
     return crop

@@ -11,8 +11,8 @@ def notebook_init(verbose=True):
     import os
     import shutil
 
-    from utils.general import check_requirements, emojis, is_colab
-    from utils.torch_utils import select_device  # imports
+    from yolov5.utils.general import check_requirements, emojis, is_colab
+    from yolov5.utils.torch_utils import select_device  # imports
 
     check_requirements(('psutil', 'IPython'))
     import psutil
@@ -21,13 +21,14 @@ def notebook_init(verbose=True):
     if is_colab():
         shutil.rmtree('/content/sample_data', ignore_errors=True)  # remove colab /sample_data directory
 
-    # System info
     if verbose:
-        gb = 1 << 30  # bytes to GiB (1024 ** 3)
+        # System info
+        # gb = 1 / 1000 ** 3  # bytes to GB
+        gib = 1 / 1024 ** 3  # bytes to GiB
         ram = psutil.virtual_memory().total
         total, used, free = shutil.disk_usage("/")
         display.clear_output()
-        s = f'({os.cpu_count()} CPUs, {ram / gb:.1f} GB RAM, {(total - free) / gb:.1f}/{total / gb:.1f} GB disk)'
+        s = f'({os.cpu_count()} CPUs, {ram * gib:.1f} GB RAM, {(total - free) * gib:.1f}/{total * gib:.1f} GB disk)'
     else:
         s = ''
 

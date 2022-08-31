@@ -7,24 +7,22 @@ Usage:
 """
 
 import argparse
-import contextlib
-import os
-import platform
+import sys
 from copy import deepcopy
 from pathlib import Path
 
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[1]  # YOLOv5 root directory
-if platform.system() != 'Windows':
-    ROOT = Path(os.path.relpath(ROOT, Path.cwd()))  # relative
+if str(ROOT) not in sys.path:
+    sys.path.append(str(ROOT))  # add ROOT to PATH
+# ROOT = ROOT.relative_to(Path.cwd())  # relative
 
 from yolov5.models.common import *
 from yolov5.models.experimental import *
 from yolov5.utils.autoanchor import check_anchor_order
 from yolov5.utils.general import LOGGER, check_version, check_yaml, make_divisible, print_args
 from yolov5.utils.plots import feature_visualization
-from yolov5.utils.torch_utils import (fuse_conv_and_bn, initialize_weights, model_info, profile, scale_img, select_device,
-                               time_sync)
+from yolov5.utils.torch_utils import fuse_conv_and_bn, initialize_weights, model_info, scale_img, select_device, time_sync
 
 try:
     import thop  # for FLOPs computation
@@ -35,60 +33,66 @@ except ImportError:
 class Detect(nn.Module):
     stride = None  # strides computed during build
     onnx_dynamic = False  # ONNX export parameter
-    export = False  # export mode
 
     def __init__(self, nc=80, anchors=(), ch=(), inplace=True):  # detection layer
         super().__init__()
         self.nc = nc  # number of classes
-        self.no = nc + 5  # number of outputs per anchor
+        self.no = nc + 5 + 180  # number of outputs per anchor
         self.nl = len(anchors)  # number of detection layers
         self.na = len(anchors[0]) // 2  # number of anchors
         self.grid = [torch.zeros(1)] * self.nl  # init grid
         self.anchor_grid = [torch.zeros(1)] * self.nl  # init anchor grid
         self.register_buffer('anchors', torch.tensor(anchors).float().view(self.nl, -1, 2))  # shape(nl,na,2)
         self.m = nn.ModuleList(nn.Conv2d(x, self.no * self.na, 1) for x in ch)  # output conv
-        self.inplace = inplace  # use inplace ops (e.g. slice assignment)
+        self.inplace = inplace  # use in-place ops (e.g. slice assignment)
 
     def forward(self, x):
+        """
+        Args:
+            x (list[P3_in,...]): torch.Size(b, c_i, h_i, w_i)
+
+        Return：
+            if train:
+                x (list[P3_out,...]): torch.Size(b, self.na, h_i, w_i, self.no), self.na means the number of anchors scales
+            else:
+                inference (tensor): (b, n_all_anchors, self.no)
+                x (list[P3_in,...]): torch.Size(b, c_i, h_i, w_i)
+        """
         z = []  # inference output
         for i in range(self.nl):
             x[i] = self.m[i](x[i])  # conv
-            bs, _, ny, nx = x[i].shape  # x(bs,255,20,20) to x(bs,3,20,20,85)
+            bs, _, ny, nx = x[i].shape  # x[i](bs,self.no * self.na,20,20) to x[i](bs,self.na,20,20,self.no)
             x[i] = x[i].view(bs, self.na, self.no, ny, nx).permute(0, 1, 3, 4, 2).contiguous()
 
             if not self.training:  # inference
                 if self.onnx_dynamic or self.grid[i].shape[2:4] != x[i].shape[2:4]:
                     self.grid[i], self.anchor_grid[i] = self._make_grid(nx, ny, i)
 
-                y = x[i].sigmoid()
+                y = x[i].sigmoid() # (tensor): (b, self.na, h, w, self.no)
                 if self.inplace:
-                    y[..., 0:2] = (y[..., 0:2] * 2 + self.grid[i]) * self.stride[i]  # xy
+                    y[..., 0:2] = (y[..., 0:2] * 2 - 0.5 + self.grid[i]) * self.stride[i]  # xy
                     y[..., 2:4] = (y[..., 2:4] * 2) ** 2 * self.anchor_grid[i]  # wh
                 else:  # for YOLOv5 on AWS Inferentia https://github.com/ultralytics/yolov5/pull/2953
-                    xy, wh, conf = y.split((2, 2, self.nc + 1), 4)  # y.tensor_split((2, 4, 5), 4)  # torch 1.8.0
-                    xy = (xy * 2 + self.grid[i]) * self.stride[i]  # xy
-                    wh = (wh * 2) ** 2 * self.anchor_grid[i]  # wh
-                    y = torch.cat((xy, wh, conf), 4)
-                z.append(y.view(bs, -1, self.no))
+                    xy = (y[..., 0:2] * 2 - 0.5 + self.grid[i]) * self.stride[i]  # xy
+                    wh = (y[..., 2:4] * 2) ** 2 * self.anchor_grid[i]  # wh
+                    y = torch.cat((xy, wh, y[..., 4:]), -1) 
+                z.append(y.view(bs, -1, self.no)) # z (list[P3_pred]): Torch.Size(b, n_anchors, self.no)
 
-        return x if self.training else (torch.cat(z, 1),) if self.export else (torch.cat(z, 1), x)
+        return x if self.training else (torch.cat(z, 1), x)
 
     def _make_grid(self, nx=20, ny=20, i=0):
         d = self.anchors[i].device
-        t = self.anchors[i].dtype
-        shape = 1, self.na, ny, nx, 2  # grid shape
-        y, x = torch.arange(ny, device=d, dtype=t), torch.arange(nx, device=d, dtype=t)
         if check_version(torch.__version__, '1.10.0'):  # torch>=1.10.0 meshgrid workaround for torch>=0.7 compatibility
-            yv, xv = torch.meshgrid(y, x, indexing='ij')
+            yv, xv = torch.meshgrid([torch.arange(ny, device=d), torch.arange(nx, device=d)], indexing='ij')
         else:
-            yv, xv = torch.meshgrid(y, x)
-        grid = torch.stack((xv, yv), 2).expand(shape) - 0.5  # add grid offset, i.e. y = 2.0 * x - 0.5
-        anchor_grid = (self.anchors[i] * self.stride[i]).view((1, self.na, 1, 1, 2)).expand(shape)
+            yv, xv = torch.meshgrid([torch.arange(ny, device=d), torch.arange(nx, device=d)])
+        grid = torch.stack((xv, yv), 2).expand((1, self.na, ny, nx, 2)).float()
+        anchor_grid = (self.anchors[i].clone() * self.stride[i]) \
+            .view((1, self.na, 1, 1, 2)).expand((1, self.na, ny, nx, 2)).float()
         return grid, anchor_grid
 
 
 class Model(nn.Module):
-    # YOLOv5 model
     def __init__(self, cfg='yolov5s.yaml', ch=3, nc=None, anchors=None):  # model, input channels, number of classes
         super().__init__()
         if isinstance(cfg, dict):
@@ -117,8 +121,8 @@ class Model(nn.Module):
             s = 256  # 2x min stride
             m.inplace = self.inplace
             m.stride = torch.tensor([s / x.shape[-2] for x in self.forward(torch.zeros(1, ch, s, s))])  # forward
-            check_anchor_order(m)  # must be in pixel-space (not grid-space)
-            m.anchors /= m.stride.view(-1, 1, 1)
+            m.anchors /= m.stride.view(-1, 1, 1) # featuremap pixel
+            check_anchor_order(m)
             self.stride = m.stride
             self._initialize_biases()  # only run once
 
@@ -128,6 +132,16 @@ class Model(nn.Module):
         LOGGER.info('')
 
     def forward(self, x, augment=False, profile=False, visualize=False):
+        """
+        Args:
+            x (tensor): (b, 3, height, width), RGB
+
+        Return：
+            if not augment:
+                x (list[P3_out, ...]): tensor.Size(b, self.na, h_i, w_i, c), self.na means the number of anchors scales
+            else:
+                
+        """
         if augment:
             return self._forward_augment(x)  # augmented inference, None
         return self._forward_once(x, profile, visualize)  # single-scale inference, train
@@ -147,6 +161,13 @@ class Model(nn.Module):
         return torch.cat(y, 1), None  # augmented inference, train
 
     def _forward_once(self, x, profile=False, visualize=False):
+        """
+        Args:
+            x (tensor): (b, 3, height, width), RGB
+
+        Return：
+            x (list[P3_out, ...]): tensor.Size(b, self.na, h_i, w_i, c), self.na means the number of anchors scales
+        """
         y, dt = [], []  # outputs
         for m in self.model:
             if m.f != -1:  # if not from previous layer
@@ -195,7 +216,7 @@ class Model(nn.Module):
             m(x.copy() if c else x)
         dt.append((time_sync() - t) * 100)
         if m == self.model[0]:
-            LOGGER.info(f"{'time (ms)':>10s} {'GFLOPs':>10s} {'params':>10s}  module")
+            LOGGER.info(f"{'time (ms)':>10s} {'GFLOPs':>10s} {'params':>10s}  {'module'}")
         LOGGER.info(f'{dt[-1]:10.2f} {o:10.2f} {m.np:10.0f}  {m.type}')
         if c:
             LOGGER.info(f"{sum(dt):10.2f} {'-':>10s} {'-':>10s}  Total")
@@ -205,9 +226,9 @@ class Model(nn.Module):
         # cf = torch.bincount(torch.tensor(np.concatenate(dataset.labels, 0)[:, 0]).long(), minlength=nc) + 1.
         m = self.model[-1]  # Detect() module
         for mi, s in zip(m.m, m.stride):  # from
-            b = mi.bias.view(m.na, -1).detach()  # conv.bias(255) to (3,85)
-            b[:, 4] += math.log(8 / (640 / s) ** 2)  # obj (8 objects per 640 image)
-            b[:, 5:] += math.log(0.6 / (m.nc - 0.999999)) if cf is None else torch.log(cf / cf.sum())  # cls
+            b = mi.bias.view(m.na, -1)  # conv.bias(255) to (3,85)
+            b.data[:, 4] += math.log(8 / (640 / s) ** 2)  # obj (8 objects per 640 image)
+            b.data[:, 5:] += math.log(0.6 / (m.nc - 0.999999)) if cf is None else torch.log(cf / cf.sum())  # cls
             mi.bias = torch.nn.Parameter(b.view(-1), requires_grad=True)
 
     def _print_biases(self):
@@ -251,24 +272,27 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
     LOGGER.info(f"\n{'':>3}{'from':>18}{'n':>3}{'params':>10}  {'module':<40}{'arguments':<30}")
     anchors, nc, gd, gw = d['anchors'], d['nc'], d['depth_multiple'], d['width_multiple']
     na = (len(anchors[0]) // 2) if isinstance(anchors, list) else anchors  # number of anchors
-    no = na * (nc + 5)  # number of outputs = anchors * (classes + 5)
+    # no = na * (nc + 5)  # number of outputs = anchors * (classes + 5)
+    no = na * (nc + 185)  # number of outputs = anchors * (classes + 185)
 
     layers, save, c2 = [], [], ch[-1]  # layers, savelist, ch out
     for i, (f, n, m, args) in enumerate(d['backbone'] + d['head']):  # from, number, module, args
         m = eval(m) if isinstance(m, str) else m  # eval strings
         for j, a in enumerate(args):
-            with contextlib.suppress(NameError):
+            try:
                 args[j] = eval(a) if isinstance(a, str) else a  # eval strings
+            except NameError:
+                pass
 
         n = n_ = max(round(n * gd), 1) if n > 1 else n  # depth gain
-        if m in (Conv, GhostConv, Bottleneck, GhostBottleneck, SPP, SPPF, DWConv, MixConv2d, Focus, CrossConv,
-                 BottleneckCSP, C3, C3TR, C3SPP, C3Ghost, nn.ConvTranspose2d, DWConvTranspose2d, C3x):
+        if m in [Conv, GhostConv, Bottleneck, GhostBottleneck, SPP, SPPF, DWConv, MixConv2d, Focus, CrossConv,
+                 BottleneckCSP, C3, C3TR, C3SPP, C3Ghost]:
             c1, c2 = ch[f], args[0]
             if c2 != no:  # if not output
                 c2 = make_divisible(c2 * gw, 8)
 
             args = [c1, c2, *args[1:]]
-            if m in [BottleneckCSP, C3, C3TR, C3Ghost, C3x]:
+            if m in [BottleneckCSP, C3, C3TR, C3Ghost]:
                 args.insert(2, n)  # number of repeats
                 n = 1
         elif m is nn.BatchNorm2d:
@@ -302,33 +326,33 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--cfg', type=str, default='yolov5s.yaml', help='model.yaml')
-    parser.add_argument('--batch-size', type=int, default=1, help='total batch size for all GPUs')
     parser.add_argument('--device', default='', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
     parser.add_argument('--profile', action='store_true', help='profile model speed')
-    parser.add_argument('--line-profile', action='store_true', help='profile model speed layer by layer')
     parser.add_argument('--test', action='store_true', help='test all yolo*.yaml')
     opt = parser.parse_args()
     opt.cfg = check_yaml(opt.cfg)  # check YAML
-    print_args(vars(opt))
+    print_args(FILE.stem, opt)
     device = select_device(opt.device)
 
     # Create model
-    im = torch.rand(opt.batch_size, 3, 640, 640).to(device)
     model = Model(opt.cfg).to(device)
+    model.train()
 
-    # Options
-    if opt.line_profile:  # profile layer by layer
-        _ = model(im, profile=True)
+    # Profile
+    if opt.profile:
+        img = torch.rand(8 if torch.cuda.is_available() else 1, 3, 640, 640).to(device)
+        y = model(img, profile=True)
 
-    elif opt.profile:  # profile forward-backward
-        results = profile(input=im, ops=[model], n=3)
-
-    elif opt.test:  # test all models
+    # Test all models
+    if opt.test:
         for cfg in Path(ROOT / 'models').rglob('yolo*.yaml'):
             try:
                 _ = Model(cfg)
             except Exception as e:
                 print(f'Error in {cfg}: {e}')
 
-    else:  # report fused model summary
-        model.fuse()
+    # Tensorboard (not working https://github.com/ultralytics/yolov5/issues/2898)
+    # from torch.utils.tensorboard import SummaryWriter
+    # tb_writer = SummaryWriter('.')
+    # LOGGER.info("Run 'tensorboard --logdir=models' to view tensorboard at http://localhost:6006/")
+    # tb_writer.add_graph(torch.jit.trace(model, img, strict=False), [])  # add model graph

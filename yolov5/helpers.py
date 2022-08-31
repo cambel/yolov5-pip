@@ -2,8 +2,8 @@ from pathlib import Path
 
 from yolov5.models.common import AutoShape, DetectMultiBackend
 from yolov5.models.experimental import attempt_load
-from yolov5.utils.general import LOGGER, logging
-from yolov5.utils.torch_utils import select_device
+from  yolov5.utils.general import LOGGER, logging
+from  yolov5.utils.torch_utils import select_device
 
 
 def load_model(model_path, device=None, autoshape=True, verbose=False):
