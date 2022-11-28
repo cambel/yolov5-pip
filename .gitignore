@@ -258,3 +258,5 @@ crashlytics-build.properties
 fabric.properties
 
 yolov5/dataset/
+
+yolov5/runs/train/
