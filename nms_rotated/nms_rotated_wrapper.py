@@ -30,10 +30,11 @@ def obb_nms(dets, scores, iou_thr, device_id=None):
     else:
         # same bug will happen when bboxes is too small
         too_small = dets_th[:, [2, 3]].min(1)[0] < 0.001 # [n]
+        # too_small = too_small.to(dets.device)
         if too_small.all(): # all the bboxes is too small
             inds = dets_th.new_zeros(0, dtype=torch.int64)
         else:
-            ori_inds = torch.arange(dets_th.size(0)) # 0 ~ n-1
+            ori_inds = torch.arange(dets_th.size(0)).to(dets.device) # 0 ~ n-1
             ori_inds = ori_inds[~too_small]
             dets_th = dets_th[~too_small] # (n_filter, 5)
             scores = scores[~too_small]

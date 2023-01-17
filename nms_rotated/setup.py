@@ -21,6 +21,7 @@ def make_cuda_ext(name, module, sources, sources_cuda=[]):
             '-D__CUDA_NO_HALF2_OPERATORS__',
         ]
         sources += sources_cuda
+        print(f'Compiling {name} with CUDA')
     else:
         print(f'Compiling {name} without CUDA')
         extension = CppExtension
