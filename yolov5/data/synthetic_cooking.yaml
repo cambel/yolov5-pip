@@ -1,0 +1,14 @@
+
+# Train/val/test sets as 1) dir: path/to/imgs, 2) file: path/to/imgs.txt, or 3) list: [path/to/imgs1, path/to/imgs2, ..]
+path: ./dataset # dataset root dir
+train: synthetic_cooking/images #images   # train images (relative to 'path') 
+val: synthetic_cooking/images #images  # val images (relative to 'path') 
+test: synthetic_cooking/images  #images # test images (optional)
+
+# Classes
+nc: 5  # number of classes
+names: ['cucumber','tomato', 'cherry_tomato', 'cut_cucumber','cut_tomato']  # class names
+
+
+# Download script/URL (optional)
+# download: https://ultralytics.com/assets/coco128.zip
